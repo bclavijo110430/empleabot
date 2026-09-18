@@ -1,0 +1,14 @@
+# Automatización de navegador
+playwright>=1.45.0
+playwright-stealth>=1.0.6
+
+# Cliente LLM (OpenAI-compatible -> FreeLLMAPI u Ollama local)
+openai>=1.50.0
+
+# Extracción de texto de CVs en PDF
+pypdf>=4.2.0
+
+# Configuración y validación
+python-dotenv>=1.0.1
+pydantic>=2.7.0
+pydantic-settings>=2.4.0

@@ -1,0 +1,36 @@
+# Entorno y secretos
+.env
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Datos sensibles / generados
+data/cvs.json
+data/profile.json
+data/sessions/*.json
+data/cv/*.pdf
+logs/*.db
+logs/*.json
+logs/screenshots/*.png
+logs/screenshots/*.jpg
+
+# Conservar plantillas y estructura de carpetas
+!data/cvs.example.json
+!data/profile.example.json
+!data/cv/.gitkeep
+!data/sessions/.gitkeep
+!logs/.gitkeep
+!logs/screenshots/.gitkeep
+
+# Editores
+.idea/
+.vscode/
+*.swp
