@@ -134,6 +134,50 @@ class AIHandler:
         return fallback
 
     # ------------------------------------------------------------------ #
+    # Validación de roles bloqueados
+    # ------------------------------------------------------------------ #
+    def is_similar_blocked_role(self, job_title: str, blocked_roles: list[str]) -> bool | None:
+        """Determina con el LLM si el título corresponde a un rol a evitar.
+
+        Va más allá de la coincidencia literal: reconoce sinónimos, traducciones
+        y variantes del mismo tipo de rol (p. ej. ``developer`` ≈
+        ``desarrollador`` ≈ ``software engineer``). Devuelve ``True``/``False`` o
+        ``None`` si el LLM no responde, para que el llamador decida.
+        """
+        if not job_title or not blocked_roles:
+            return False
+        system = (
+            "Eres un experto en reclutamiento. Determina si una oferta de empleo "
+            "pertenece al mismo tipo de rol que alguno de los roles que el candidato "
+            "quiere EVITAR, aunque el título use sinónimos, otros idiomas o variantes "
+            "(p. ej. 'developer' ≈ 'desarrollador' ≈ 'programador' ≈ "
+            "'software engineer'). Responde SIEMPRE con un objeto JSON con la forma "
+            '{"blocked": true|false, "reason": "motivo breve"}. Marca blocked=true '
+            "solo si el puesto es del mismo tipo de rol que algún rol a evitar; no lo "
+            "marques por compartir sector, herramientas o empresa."
+        )
+        user = (
+            f"ROLES A EVITAR:\n{json.dumps(blocked_roles, ensure_ascii=False)}\n\n"
+            f"TÍTULO DE LA OFERTA: {job_title}\n\n"
+            "Devuelve el JSON ahora."
+        )
+        content = self._chat(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            json_mode=True,
+        )
+        data = _parse_json(content)
+        if isinstance(data, dict) and "blocked" in data:
+            blocked = bool(data.get("blocked"))
+            logger.info(
+                "Validación de rol por LLM: %s (%s)",
+                "bloqueado" if blocked else "permitido",
+                data.get("reason", ""),
+            )
+            return blocked
+        logger.warning("El LLM no validó el rol de '%s'.", job_title)
+        return None
+
+    # ------------------------------------------------------------------ #
     # Análisis de CVs (generación de cvs.json y profile.json)
     # ------------------------------------------------------------------ #
     def extract_cv_metadata(self, filename: str, cv_text: str) -> dict:
@@ -315,6 +359,9 @@ class AIHandler:
             "Responde en el mismo idioma de cada pregunta, de forma breve, honesta y profesional. "
             "Si la pregunta es de sí/no responde 'Sí' o 'No' (o 'Yes'/'No' en inglés). "
             "Si la pregunta trae 'options', responde EXACTAMENTE con una de esas opciones. "
+            "Si el tipo es 'checkbox' (selección múltiple, 'select all that apply'), responde con "
+            "una o varias opciones de la lista separadas por comas, usando el texto exacto de cada "
+            "opción. Si ninguna aplica y existe la opción 'None of the above'/'Ninguna', usa esa. "
             "Si es numérica responde solo con el número. "
             f"REGLAS SALARIALES (obligatorias): la expectativa salarial es {salary}. "
             "Si piden otro periodo, convierte proporcionalmente (anual = mensual x12, quincenal = mensual /2). "

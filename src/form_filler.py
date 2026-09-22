@@ -62,7 +62,21 @@ SUCCESS_PHRASES = (
     "already applied",
 )
 ERROR_PHRASES = ("no se pudo enviar", "something went wrong", "se produjo un error", "no pudimos enviar")
+ALREADY_APPLIED_PHRASES = (
+    "empleo solicitado",
+    "currículum enviado",
+    "curriculum enviado",
+    "solicitud enviada",
+    "candidatura enviada",
+    "ya te has inscrito",
+    "already applied",
+    "application submitted",
+    "you applied",
+)
 RESUME_FILE_RE = re.compile(r"\.(pdf|docx?|rtf)$", re.IGNORECASE)
+
+# Cache del perfil propio de LinkedIn (se resuelve una vez por ejecución).
+_SELF_LINKEDIN_URL = ""
 
 
 class EasyApplyFormFiller:
@@ -82,6 +96,7 @@ class EasyApplyFormFiller:
         self.ai = ai
         self.cv_context = self._build_cv_context(cv_meta)
         self.routed_via = ""
+        self.self_linkedin_url = ""
 
     @staticmethod
     def _build_cv_context(cv_meta: dict | None) -> str:
@@ -105,10 +120,22 @@ class EasyApplyFormFiller:
     # ------------------------------------------------------------------ #
     async def apply(self, job: Job, cv_path: Path | None) -> tuple[bool, str]:
         """Devuelve (éxito, mensaje_de_error)."""
+        if await self._already_applied():
+            return False, "ya postulado previamente"
+
+        # Si el perfil no trae LinkedIn, usamos el del usuario logueado para
+        # poder responder el campo obligatorio "LinkedIn Profile".
+        if not self.profile.get("linkedin_url"):
+            self.self_linkedin_url = await self._fetch_self_linkedin_url(job.url)
+            if self.self_linkedin_url:
+                self.profile["linkedin_url"] = self.self_linkedin_url
+
         if not await self._open_modal():
             return False, "no se pudo abrir el formulario de Easy Apply"
 
         container = await self._find_form_container()
+        last_label: str | None = None
+        stuck = 0
         for step in range(1, self.settings.max_form_steps + 1):
             await random_pause(self.settings)
 
@@ -120,14 +147,21 @@ class EasyApplyFormFiller:
                 await take_screenshot(self.page, f"sin-boton-paso-{step}")
                 return False, f"no se encontró botón de avance en el paso {step}"
 
+            if label == last_label:
+                stuck += 1
+            else:
+                stuck = 0
+                last_label = label
+            if stuck >= 4:
+                await take_screenshot(self.page, f"paso-bloqueado-{step}")
+                return False, f"el formulario no avanza (paso '{label}')"
+
             action = _classify_button(label)
             button = await self._find_progress_button(container)
             if button is None:
                 return False, "el botón de avance desapareció"
-            try:
-                await button.click()
-            except Exception as exc:  # noqa: BLE001
-                return False, f"no se pudo pulsar '{label}': {exc}"
+            if not await self._safe_click(button, timeout=self.settings.action_timeout_ms):
+                return False, f"no se pudo pulsar '{label}' (bloqueado por un overlay)"
             logger.info("Paso %d (%s)", step, label.split("|")[0])
             await random_pause(self.settings)
 
@@ -213,6 +247,18 @@ class EasyApplyFormFiller:
             )
             targets.append({"kind": "radio", "options": options})
 
+        # 1b. Grupos de checkboxes (selección múltiple).
+        for question_text, options in await self._collect_checkbox_groups(scope):
+            questions.append(
+                {
+                    "id": len(questions),
+                    "question": question_text,
+                    "type": "checkbox",
+                    "options": [label for _, label in options],
+                }
+            )
+            targets.append({"kind": "checkbox", "options": options})
+
         # 2. Campos de texto, número, textarea y select.
         fields = await scope.query_selector_all("input, select, textarea")
         for field in fields:
@@ -227,11 +273,13 @@ class EasyApplyFormFiller:
                 label = await self._field_label(field)
 
                 if tag == "select":
-                    if await field.input_value():
-                        continue
-                    options = await field.evaluate(
+                    current = (await field.input_value() or "").strip()
+                    if current and not _is_placeholder_option(current):
+                        continue  # LinkedIn ya lo seleccionó
+                    raw_options = await field.evaluate(
                         "el => Array.from(el.options).map(o => o.text.trim()).filter(Boolean)"
                     )
+                    options = [opt for opt in raw_options if not _is_placeholder_option(opt)]
                     if not options:
                         continue
                     questions.append(
@@ -253,15 +301,20 @@ class EasyApplyFormFiller:
                     continue  # LinkedIn ya lo rellenó
                 if not label.strip():
                     continue
+                numeric = input_type == "number" or (
+                    tag != "textarea" and _looks_numeric_question(label)
+                )
                 questions.append(
                     {
                         "id": len(questions),
                         "question": label,
-                        "type": "number" if input_type == "number" else ("textarea" if tag == "textarea" else "text"),
+                        "type": "number" if numeric else ("textarea" if tag == "textarea" else "text"),
                         "options": [],
                     }
                 )
-                targets.append({"kind": "text", "handle": field, "input_type": input_type})
+                targets.append(
+                    {"kind": "text", "handle": field, "input_type": input_type, "numeric": numeric}
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.debug("Error recolectando un campo: %s", exc)
 
@@ -324,13 +377,88 @@ class EasyApplyFormFiller:
         question = await self._radio_question(elements[0]) or "Selecciona una opción"
         return question, options
 
+    async def _collect_checkbox_groups(
+        self, scope: Any
+    ) -> list[tuple[str, list[tuple[Any, str]]]]:
+        """Devuelve grupos de checkboxes (selección múltiple) por nombre."""
+        groups: list[tuple[str, list[tuple[Any, str]]]] = []
+        by_name: dict[str, list[Any]] = {}
+        for box in await scope.query_selector_all("input[type='checkbox'][name]"):
+            try:
+                if not await box.is_visible() or not await box.is_enabled():
+                    continue
+                name = await box.get_attribute("name") or ""
+                by_name.setdefault(name, []).append(box)
+            except Exception:  # noqa: BLE001
+                continue
+
+        for boxes in by_name.values():
+            built = await self._build_checkbox_group(boxes)
+            if built:
+                groups.append(built)
+        return groups
+
+    async def _build_checkbox_group(
+        self, elements: list[Any]
+    ) -> tuple[str, list[tuple[Any, str]]] | None:
+        options: list[tuple[Any, str]] = []
+        seen: set[str] = set()
+        for element in elements:
+            label = ((await self._field_label(element)) or "").strip()
+            if not label or label in seen:
+                continue
+            seen.add(label)
+            options.append((element, label))
+        if not options:
+            return None
+
+        question = await self._checkbox_question(elements[0]) or ""
+        if any(word in question.lower() for word in CONSENT_KEYWORDS):
+            return None  # consentimientos se marcan automáticamente
+        return question or "Selecciona las opciones que apliquen", options
+
+    async def _checkbox_question(self, element: Any) -> str:
+        """Obtiene el enunciado del grupo de checkboxes."""
+        try:
+            return (
+                await element.evaluate(
+                    """
+                    (el) => {
+                        const clean = (t) => (t || '').replace(/\\s+/g, ' ').trim().slice(0, 300);
+                        const group = el.closest("[role='group'], [role='radiogroup'], fieldset");
+                        if (group) {
+                            const aria = group.getAttribute('aria-label');
+                            if (aria) return clean(aria);
+                            const labelledBy = group.getAttribute('aria-labelledby');
+                            if (labelledBy) {
+                                const ref = document.getElementById(labelledBy);
+                                if (ref) return clean(ref.innerText);
+                            }
+                            const legend = group.querySelector('legend');
+                            if (legend) return clean(legend.innerText);
+                        }
+                        let node = el.parentElement;
+                        for (let i = 0; i < 6 && node; i += 1) {
+                            const text = (node.innerText || '').trim();
+                            if (text.length > 3 && text.length < 300) return clean(text);
+                            node = node.parentElement;
+                        }
+                        return '';
+                    }
+                    """
+                )
+                or ""
+            )
+        except Exception:  # noqa: BLE001
+            return ""
+
     async def _apply_answer(self, target: dict, question: dict, answer: str) -> None:
         """Aplica una respuesta como texto o selección según el tipo."""
         kind = target.get("kind")
         try:
             if kind == "text":
                 value = answer
-                if target.get("input_type") == "number" or _looks_numeric(answer):
+                if target.get("numeric") or target.get("input_type") == "number" or _looks_numeric(answer):
                     value = _extract_number(answer) or answer
                 await target["handle"].fill(str(value))
             elif kind == "select":
@@ -350,6 +478,30 @@ class EasyApplyFormFiller:
                     await self._click_element(handle)
                 else:
                     logger.debug("Respuesta '%s' sin opción válida para el radio.", answer)
+            elif kind == "checkbox":
+                labels = [label for _, label in target["options"]]
+                wanted = [part.strip() for part in answer.split(",") if part.strip()]
+                matched = False
+                for want in wanted:
+                    option = _best_option(want, labels)
+                    handle = next(
+                        (element for element, label in target["options"] if label == option), None
+                    )
+                    if handle is not None:
+                        await self._click_element(handle)
+                        matched = True
+                if not matched:
+                    none_option = _best_option(
+                        "none of the above", labels
+                    ) or _best_option("ninguna de las anteriores", labels)
+                    handle = next(
+                        (element for element, label in target["options"] if label == none_option),
+                        None,
+                    )
+                    if handle is not None:
+                        await self._click_element(handle)
+                    else:
+                        logger.debug("Respuesta '%s' sin opción válida para el checkbox.", answer)
             logger.debug("[%s] '%s' -> '%s'", kind, question["question"][:50], str(answer)[:50])
         except Exception as exc:  # noqa: BLE001
             logger.debug("No se pudo aplicar '%s': %s", answer, exc)
@@ -447,47 +599,173 @@ class EasyApplyFormFiller:
             (words) => {
                 const nodes = [...document.querySelectorAll('button, a')]
                     .filter((n) => n.offsetWidth || n.offsetHeight);
-                return nodes.find((n) => {
+                const matches = (n) => {
                     const text = ((n.innerText || '') + ' ' + (n.getAttribute('aria-label') || '')).toLowerCase();
                     return words.some((w) => text.includes(w));
-                }) || null;
+                };
+                const link = nodes.find((n) => (n.getAttribute('href') || '').includes('/apply/') && matches(n));
+                return link || nodes.find(matches) || null;
             }
             """,
             list(APPLY_KEYWORDS),
         )
         return handle.as_element()
 
+    async def _fetch_self_linkedin_url(self, return_url: str = "") -> str:
+        """Obtiene la URL del perfil del usuario logueado (vía ``/in/me/``)."""
+        global _SELF_LINKEDIN_URL
+        if _SELF_LINKEDIN_URL:
+            return _SELF_LINKEDIN_URL
+        try:
+            await self.page.goto(
+                "https://www.linkedin.com/in/me/", wait_until="domcontentloaded"
+            )
+            await asyncio.sleep(2)
+            current = (self.page.url or "").split("?")[0]
+            match = re.search(r"/in/([^/]+)/?$", current)
+            if match and match.group(1) != "me":
+                _SELF_LINKEDIN_URL = current
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("No se pudo obtener el perfil propio: %s", exc)
+        finally:
+            if return_url:
+                try:
+                    await self.page.goto(return_url, wait_until="domcontentloaded")
+                    await asyncio.sleep(2)
+                except Exception:  # noqa: BLE001
+                    pass
+        return _SELF_LINKEDIN_URL
+
+    async def _already_applied(self) -> bool:
+        """Detecta si la oferta ya fue solicitada (p. ej. en el sitio externo)."""
+        try:
+            content = (await self.page.inner_text("body")).lower()
+        except Exception:  # noqa: BLE001
+            return False
+        return any(phrase in content for phrase in ALREADY_APPLIED_PHRASES)
+
     async def _open_modal(self) -> bool:
         button = await self._find_apply_button()
+        # LinkedIn expone el nuevo flujo SDUI como un enlace a /apply/; pulsarlo
+        # resulta poco fiable (el overlay #interop-outlet lo intercepta), así que
+        # navegamos directamente a esa URL, que abre el modal de postulación.
+        # Si el botón no expone el enlace, derivamos la URL desde la oferta.
+        href = await self._apply_href(button) if button is not None else ""
+        if not href:
+            href = await self._derive_apply_url()
+        if href:
+            # Algunas ofertas muestran primero un "recordatorio de seguridad":
+            # al confirmarlo se cierra sin abrir el formulario, así que hay que
+            # reintentar la navegación a la URL de postulación.
+            for attempt in range(1, 4):
+                logger.info(
+                    "Abriendo el flujo de postulación (intento %d): %s", attempt, href
+                )
+                try:
+                    await self.page.goto(href, wait_until="domcontentloaded")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("No se pudo navegar al flujo de postulación: %s", exc)
+                if await self._wait_for_form(15):
+                    return True
+
         if button is None:
-            return False
-        try:
-            await button.scroll_into_view_if_needed()
-            await button.click()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("No se pudo pulsar Easy Apply: %s", exc)
+            logger.warning("No se encontró el botón de Easy Apply en la oferta.")
             return False
 
-        for _ in range(10):
+        await self._remove_interop_overlay()
+        for attempt in range(1, 4):
+            if not await self._safe_click(button):
+                logger.warning("No se pudo pulsar Easy Apply (intento %d).", attempt)
+                await asyncio.sleep(1)
+                continue
+            if await self._wait_for_form(15):
+                return True
+            logger.warning("El formulario no apareció tras el intento %d.", attempt)
+        return False
+
+    async def _derive_apply_url(self) -> str:
+        """Construye la URL de postulación a partir de la URL de la oferta."""
+        url = (self.page.url or "").split("?")[0]
+        match = re.search(r"/jobs/view/(\d+)", url)
+        if not match:
+            return ""
+        return (
+            f"https://www.linkedin.com/jobs/view/{match.group(1)}"
+            "/apply/?openSDUIApplyFlow=true"
+        )
+
+    async def _wait_for_form(self, attempts: int = 20) -> bool:
+        """Espera al formulario, confirmando diálogos intermedios de seguridad."""
+        for _ in range(attempts):
             await asyncio.sleep(1)
             if await self._form_present():
                 return True
+            await self._dismiss_safety_dialog()
         return False
 
+    async def _dismiss_safety_dialog(self) -> bool:
+        """Pulsa "Continuar la solicitud" en el recordatorio de seguridad."""
+        try:
+            handle = await self.page.evaluate_handle(
+                """
+                () => {
+                    const words = ['continuar la solicitud', 'continue to application',
+                                   'continue application', 'continuar con la solicitud'];
+                    const nodes = [...document.querySelectorAll('button, a')]
+                        .filter((n) => n.offsetWidth || n.offsetHeight);
+                    return nodes.find((n) => {
+                        const text = ((n.innerText || '') + ' ' + (n.getAttribute('aria-label') || '')).toLowerCase();
+                        return words.some((w) => text.includes(w));
+                    }) || null;
+                }
+                """
+            )
+            element = handle.as_element()
+            if element is None:
+                return False
+            logger.info("Confirmando el recordatorio de seguridad de LinkedIn.")
+            return await self._safe_click(element)
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    async def _apply_href(button: Any) -> str:
+        """Devuelve la URL de postulación del botón si es un enlace de Easy Apply."""
+        try:
+            href = await button.get_attribute("href")
+        except Exception:  # noqa: BLE001
+            return ""
+        if not href or "/apply/" not in href:
+            return ""
+        if href.startswith("/"):
+            return f"https://www.linkedin.com{href}"
+        return href
+
     async def _form_present(self) -> bool:
-        """Detecta si el formulario de Easy Apply está abierto."""
+        """Detecta si el modal de Easy Apply está abierto.
+
+        Se exige un diálogo visible que contenga un campo de formulario y un
+        botón de avance (o un input de archivo), para no confundirlo con
+        botones "Siguiente" de carruseles de la propia página de la oferta.
+        """
         try:
             return bool(
                 await self.page.evaluate(
                     """
                     () => {
-                        const match = (sel, words) => [...document.querySelectorAll(sel)].some((n) => {
-                            const text = ((n.innerText || '') + ' ' + (n.getAttribute('aria-label') || '')).toLowerCase();
-                            return words.some((w) => text.includes(w));
+                        const progressWords = ['enviar solicitud', 'submit application', 'siguiente', 'next',
+                                               'revisar', 'review', 'continuar', 'continue',
+                                               'cargar currículum', 'upload resume'];
+                        const hasProgress = (root) => [...root.querySelectorAll('button')].some((b) => {
+                            const text = ((b.innerText || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
+                            return progressWords.some((w) => text.includes(w));
                         });
-                        return match('button', ['enviar solicitud', 'submit application', 'siguiente', 'next', 'revisar', 'review', 'continuar', 'continue'])
-                            || !!document.querySelector("[role='radiogroup']")
-                            || match('button', ['cargar currículum', 'upload resume']);
+                        const hasField = (root) => !!root.querySelector(
+                            "input:not([type='hidden']):not([type='checkbox']), select, textarea, [role='radiogroup'], input[type='file']"
+                        );
+                        const dialogs = [...document.querySelectorAll(".artdeco-modal, [role='dialog']")]
+                            .filter((d) => d.offsetWidth || d.offsetHeight);
+                        return dialogs.some((d) => (hasField(d) && hasProgress(d)) || !!d.querySelector("input[type='file'], [role='radiogroup']"));
                     }
                     """
                 )
@@ -508,6 +786,11 @@ class EasyApplyFormFiller:
                         return progressWords.some((w) => text.includes(w));
                     });
                     if (!progress) return null;
+
+                    // Preferir el modal completo: contiene todos los campos del
+                    // paso, incluidos los que quedan por encima del botón.
+                    const dialog = progress.closest(".artdeco-modal, [role='dialog']");
+                    if (dialog) return dialog;
 
                     const fieldSelector = "input:not([type='hidden']), select, textarea, [role='radiogroup'], [role='radio']";
                     let node = progress;
@@ -634,19 +917,68 @@ class EasyApplyFormFiller:
 
     async def _click_element(self, element: Any) -> bool:
         """Hace clic en el elemento o en su label contenedor si está oculto."""
-        try:
-            await element.click(timeout=3000)
+        if await self._safe_click(element, timeout=3000):
             return True
-        except Exception:  # noqa: BLE001
-            pass
         try:
             handle = await element.evaluate_handle("el => el.closest('label') || el.parentElement")
             parent = handle.as_element()
             if parent is not None:
-                await parent.click(timeout=3000)
-                return True
+                return await self._safe_click(parent, timeout=3000)
         except Exception:  # noqa: BLE001
             pass
+        return False
+
+    async def _remove_interop_overlay(self) -> None:
+        """Elimina el overlay de LinkedIn que intercepta los clics."""
+        try:
+            await self.page.evaluate(
+                """
+                () => {
+                    const selectors = ['#interop-outlet', '[data-testid="interop-shadowdom"]'];
+                    selectors.forEach((sel) =>
+                        document.querySelectorAll(sel).forEach((node) => node.remove())
+                    );
+                }
+                """
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("No se pudo limpiar el overlay interop: %s", exc)
+
+    async def _safe_click(self, element: Any, timeout: int = 5000) -> bool:
+        """Hace clic sorteando overlays y sin depender de la acción nativa.
+
+        LinkedIn inyecta ``#interop-outlet``, que intercepta los eventos de
+        puntero y provoca timeouts en ``click()``. Se intenta el clic normal,
+        luego se retira el overlay y, como último recurso, se despacha un clic
+        sintético directamente sobre el elemento.
+        """
+        try:
+            await element.scroll_into_view_if_needed(timeout=timeout)
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
+            await element.click(timeout=timeout)
+            return True
+        except Exception:  # noqa: BLE001
+            pass
+
+        await self._remove_interop_overlay()
+        try:
+            await element.click(timeout=timeout, force=True)
+            return True
+        except Exception:  # noqa: BLE001
+            pass
+
+        for dispatch in (True, False):
+            try:
+                if dispatch:
+                    await element.dispatch_event("click")
+                else:
+                    await element.evaluate("el => el.click()")
+                return True
+            except Exception:  # noqa: BLE001
+                continue
         return False
 
     # ------------------------------------------------------------------ #
@@ -754,7 +1086,29 @@ def _classify_button(label: str) -> str:
     return "next"
 
 
+# Botones de acción sobre entradas (editar/eliminar/añadir) pueden contener
+# "siguiente" en su aria-label (p. ej. "Edite la siguiente entrada de
+# experiencia") y no deben confundirse con el botón de avance del formulario.
+EXCLUDE_KEYWORDS = (
+    "eliminar",
+    "quitar",
+    "borrar",
+    "delete",
+    "remove",
+    "discard",
+    "editar",
+    "edit",
+    "añadir",
+    "agregar",
+    "add",
+    "crear",
+    "create",
+)
+
+
 def _button_priority(combined: str) -> int:
+    if any(keyword in combined for keyword in EXCLUDE_KEYWORDS):
+        return 0
     if any(keyword in combined for keyword in SUBMIT_KEYWORDS):
         return 1
     if any(keyword in combined for keyword in REVIEW_KEYWORDS):
@@ -777,6 +1131,61 @@ def _best_option(answer: str | None, options: list[str]) -> str | None:
         if candidate and (normalized in candidate or candidate in normalized):
             return option
     return None
+
+
+PLACEHOLDER_OPTIONS = (
+    "selecciona una opción",
+    "selecciona una opcion",
+    "seleccione una opción",
+    "seleccione una opcion",
+    "seleccionar",
+    "select an option",
+    "select one",
+    "choose an option",
+    "please select",
+    "elegir",
+)
+
+
+NUMERIC_QUESTION_HINTS = (
+    "años",
+    "anos",
+    "years",
+    "experiencia",
+    "experience",
+    "salario",
+    "salarial",
+    "salary",
+    "aspiración",
+    "aspiracion",
+    "expectativa",
+    "remuneración",
+    "remuneracion",
+    "pretensión",
+    "pretension",
+    "sueldo",
+    "compensation",
+    "wage",
+    "monto",
+    "cantidad",
+    "número",
+    "numero",
+    "number",
+)
+
+
+def _looks_numeric_question(label: str) -> bool:
+    """Heurística: la pregunta espera una respuesta numérica."""
+    lowered = (label or "").lower()
+    return any(hint in lowered for hint in NUMERIC_QUESTION_HINTS)
+
+
+def _is_placeholder_option(text: str) -> bool:
+    """Indica si el texto de una opción es un placeholder (sin elegir)."""
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return True
+    return any(placeholder in lowered for placeholder in PLACEHOLDER_OPTIONS)
 
 
 def _looks_numeric(value: str) -> bool:

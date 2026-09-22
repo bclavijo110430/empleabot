@@ -6,6 +6,8 @@ se definen como constantes de módulo.
 """
 from __future__ import annotations
 
+import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +31,14 @@ CVS_META_PATH = DATA_DIR / "cvs.json"
 
 # Proveedores de inferencia soportados (ambos exponen una API OpenAI-compatible).
 LLM_PROVIDERS = ("freellmapi", "ollama")
+
+
+def normalize_text(value: str) -> str:
+    """Normaliza texto para comparar: minúsculas, sin acentos ni puntuación."""
+    value = unicodedata.normalize("NFKD", value or "")
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    value = re.sub(r"[^a-z0-9]+", " ", value.lower())
+    return re.sub(r"\s+", " ", value).strip()
 
 
 @dataclass(frozen=True)
@@ -113,9 +123,20 @@ class Settings(BaseSettings):
     # o un storage_state de Playwright). Relativa a la raíz del proyecto.
     linkedin_cookies_file: str = ""
 
+    # --- Empresas bloqueadas ---
+    # Lista separada por comas. No se postulará a ofertas de estas empresas.
+    # Ejemplo: BLOCKED_COMPANIES=inetum,acme corp
+    blocked_companies: str = "inetum"
+
+    # --- Roles bloqueados ---
+    # Lista separada por comas. No se postulará a ofertas cuyo título coincida
+    # con alguno de estos roles (comparación sin acentos ni mayúsculas).
+    # Ejemplo: BLOCKED_ROLES=desarrollador full stack,frontend developer
+    blocked_roles: str = ""
+
     # --- Límites ---
     max_applications: int = 25
-    max_form_steps: int = 12
+    max_form_steps: int = 20
 
     # --- Expectativa salarial (se inyecta en el perfil) ---
     # currency: "USD" o "COP"; period: "mensual", "anual", "quincenal", etc.
@@ -142,6 +163,76 @@ class Settings(BaseSettings):
             model=self.freelm_model or "auto",
             timeout=self.freelm_timeout,
             max_retries=self.freelm_max_retries,
+        )
+
+    @property
+    def blocked_companies_list(self) -> list[str]:
+        """Empresas bloqueadas normalizadas (minúsculas, sin espacios extra)."""
+        return [
+            item.strip().lower()
+            for item in self.blocked_companies.split(",")
+            if item.strip()
+        ]
+
+    def is_company_blocked(self, company: str) -> bool:
+        """Indica si una empresa está en la lista de bloqueo."""
+        normalized = (company or "").strip().lower()
+        if not normalized:
+            return False
+        return any(
+            blocked in normalized or normalized in blocked
+            for blocked in self.blocked_companies_list
+        )
+
+    @property
+    def blocked_roles_list(self) -> list[str]:
+        """Roles bloqueados normalizados (minúsculas, sin acentos)."""
+        return [
+            normalize_text(item)
+            for item in self.blocked_roles.split(",")
+            if item.strip()
+        ]
+
+    def is_role_blocked(self, *texts: str) -> bool:
+        """Indica si el título (u otro texto) de la oferta coincide con un rol bloqueado.
+
+        La comparación ignora mayúsculas, acentos y guiones, y exige que el rol
+        aparezca como palabra completa (p. ej. "java" no bloquea "javascript").
+        """
+        roles = self.blocked_roles_list
+        if not roles:
+            return False
+        for text in texts:
+            haystack = normalize_text(text)
+            if not haystack:
+                continue
+            for role in roles:
+                if re.search(rf"\b{re.escape(role)}\b", haystack):
+                    return True
+        return False
+
+    @property
+    def search_query_terms(self) -> list[str]:
+        """Términos individuales de la búsqueda, normalizados."""
+        return [
+            value
+            for value in (
+                normalize_text(item) for item in self.search_query.split(",")
+            )
+            if value
+        ]
+
+    def title_matches_search(self, title: str) -> bool:
+        """Indica si el título contiene alguno de los términos de la búsqueda.
+
+        Estos títulos se consideran deseados y nunca se bloquean por rol.
+        """
+        haystack = normalize_text(title)
+        if not haystack:
+            return False
+        return any(
+            re.search(rf"\b{re.escape(term)}\b", haystack)
+            for term in self.search_query_terms
         )
 
     @property

@@ -156,6 +156,60 @@ async def run(args: argparse.Namespace) -> int:
                     )
                     continue
 
+                if settings.is_company_blocked(job.company):
+                    logger.info(
+                        "Empresa bloqueada (%s), se omite: %s",
+                        job.company or "?",
+                        job.title or url,
+                    )
+                    storage.record(
+                        Application(
+                            job_id=job_id,
+                            title=job.title,
+                            company=job.company,
+                            location=job.location,
+                            url=url,
+                            cv_used="",
+                            status="skipped",
+                            error="empresa bloqueada",
+                        )
+                    )
+                    continue
+
+                # Los títulos que coinciden con la búsqueda deseada nunca se
+                # bloquean por rol. El resto se valida contra BLOCKED_ROLES:
+                # primero coincidencia literal y, si no, similitud vía LLM.
+                if settings.blocked_roles_list and not settings.title_matches_search(
+                    job.title
+                ):
+                    blocked = settings.is_role_blocked(job.title)
+                    if not blocked:
+                        blocked = (
+                            ai.is_similar_blocked_role(
+                                job.title, settings.blocked_roles_list
+                            )
+                            is True
+                        )
+                    if blocked:
+                        logger.info(
+                            "Rol bloqueado, se omite: %s @ %s",
+                            job.title or "?",
+                            job.company or "?",
+                        )
+                        storage.record(
+                            Application(
+                                job_id=job_id,
+                                title=job.title,
+                                company=job.company,
+                                location=job.location,
+                                url=url,
+                                cv_used="",
+                                status="skipped",
+                                error="rol bloqueado",
+                            )
+                        )
+                        continue
+
                 if settings.easy_apply_only and not job.easy_apply:
                     logger.info("Sin Easy Apply, se omite: %s", job.title or url)
                     storage.record(
@@ -184,6 +238,7 @@ async def run(args: argparse.Namespace) -> int:
                 )
 
                 if args.dry_run:
+                    applied += 1
                     logger.info("[dry-run] Se omitiría el envío.")
                     continue
 
@@ -199,6 +254,13 @@ async def run(args: argparse.Namespace) -> int:
                 else:
                     await take_screenshot(page, f"fallo-{job_id}")
 
+                if success:
+                    status = "applied"
+                elif error == "ya postulado previamente":
+                    status = "skipped"
+                else:
+                    status = "failed"
+
                 storage.record(
                     Application(
                         job_id=job_id,
@@ -207,7 +269,7 @@ async def run(args: argparse.Namespace) -> int:
                         location=job.location,
                         url=url,
                         cv_used=cv_path.name if cv_path else "",
-                        status="applied" if success else "failed",
+                        status=status,
                         error=error,
                         routed_via=getattr(ai, "last_routed_via", ""),
                     )
